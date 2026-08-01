@@ -1,3 +1,1 @@
-"""json-extract-comments package."""
-
 __version__ = "1.0.0"

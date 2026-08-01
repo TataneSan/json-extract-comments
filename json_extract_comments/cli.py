@@ -1,186 +1,216 @@
-#!/usr/bin/env python3
-"""json-extract-comments - Pull comment-like fields out of JSON/JSONL documents.
+"""json-extract-comments: extract comment-like fields from JSONL documents.
 
-Many JSON workloads sneak informal comments into objects as "//...", "_comment",
-"comment_*" keys, or as plain "//"-prefixed lines between documents. This tool
-collects them and prints them (one per line, or grouped as JSON), so the rest
-of the pipeline can consume strictly typed JSON.
+Keys are considered comment-like when they equal ``//`` or start with
+``comment_`` (configurable via --patterns as extra regexes). Only top-level
+keys are scanned by default; use --recursive to walk nested objects and arrays.
+
+Output: one JSON object per match, as JSONL, with the shape
+{"path": <dotted key path>, "value": <original JSON value>}.
 
 Exit codes:
-    0 - success
-    1 - I/O or CLI error
-    2 - --check found no comment at all (CI gate)
+  0  success
+  1  CLI / I-O / JSON parse error
+  2  --check condition not satisfied (no comment-like field found)
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
-PROG = "json-extract-comments"
-VERSION = "1.0.0"
-
-DEFAULT_KEYS = ["//", "_comment", "comment", "comments", "note", "notes",
-                "description", "_note"]
+DEFAULT_PATTERNS = [r"^//$", r"^comment_"]
 
 
-def is_comment_line(line):
-    s = line.lstrip()
-    return s.startswith("//") or s.startswith("#")
-
-
-def walk(obj, path, keys, prefix_mode, out):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            new_path = "%s.%s" % (path, k) if path else k
-            kl = k.lower()
-            matched = False
-            if prefix_mode:
-                matched = any(kl.startswith(p.lower()) or kl == p.lower()
-                              for p in keys)
-            else:
-                matched = kl in [x.lower() for x in keys]
-            if matched and isinstance(v, str):
-                out.append((new_path, v))
-            elif matched:
-                out.append((new_path, v))
-            walk(v, new_path, keys, prefix_mode, out)
-    elif isinstance(obj, list):
-        for i, item in enumerate(obj):
-            walk(item, "%s[%d]" % (path, i), keys, prefix_mode, out)
-
-
-def parse_documents(text):
-    """Return (docs, bare_comments) splitting comment lines from JSON lines."""
-    bare = []
-    json_part_lines = []
-    for line in text.splitlines():
-        if is_comment_line(line):
-            bare.append(line.strip())
-        else:
-            json_part_lines.append(line)
-    json_part = "\n".join(json_part_lines).strip()
-    docs = []
-    if json_part:
-        try:
-            docs = [json.loads(json_part)]
-        except json.JSONDecodeError:
-            docs = []
-            for lineno, line in enumerate(json_part.splitlines(), 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    docs.append(json.loads(line))
-                except json.JSONDecodeError as exc:
-                    raise ValueError("invalid JSON at line %d: %s" % (lineno, exc))
-    return docs, bare
-
-
-def main(argv=None):
+def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog=PROG,
-        description="Extract comment-like fields (//, _comment, comment_*, ...) "
-        "from JSON/JSONL documents and standalone comment lines.",
+        prog="json-extract-comments",
+        description=(
+            "Extract comment-like fields ('//', 'comment_*') from JSONL "
+            "documents, one match per line as JSON."
+        ),
     )
-    p.add_argument("file", nargs="?", default="-",
-                   help="input JSON/JSONL file (default: stdin)")
-    p.add_argument("--keys", metavar="KEY,KEY,...",
-                   help="comma-separated keys to look for (default: %s)"
-                   % ",".join(DEFAULT_KEYS))
-    p.add_argument("--prefix", action="store_true",
-                   help="match keys by prefix (comment_* style) instead of exact name")
-    p.add_argument("--strip", action="store_true",
-                   help="output JSONL with comment fields removed instead of extracting them")
-    p.add_argument("--check", action="store_true",
-                   help="CI: exit 2 if no comment was found")
-    p.add_argument("--json", action="store_true",
-                   help="print the extracted comments as a JSON array of {path,value}")
-    p.add_argument("-q", "--quiet", action="store_true")
-    p.add_argument("--version", action="version", version="%(prog)s " + VERSION)
-    args = p.parse_args(argv)
+    p.add_argument(
+        "input",
+        nargs="?",
+        default="-",
+        help="Input JSONL file (default: stdin). Use '-' for stdin.",
+    )
+    p.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Walk nested objects and arrays (keys inside them are matched too).",
+    )
+    p.add_argument(
+        "--patterns",
+        default=None,
+        help=(
+            "Comma-separated extra regexes matched against keys. "
+            "Defaults: keys equal to '//' or starting with 'comment_'."
+        ),
+    )
+    p.add_argument(
+        "--separator",
+        default=".",
+        help="Separator used in dotted key paths (default: '.').",
+    )
+    p.add_argument(
+        "--strip",
+        action="store_true",
+        help="Instead of extracting, remove comment-like fields and output the cleaned JSONL.",
+    )
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit 2 when no comment-like field is found.",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable summary to stderr.",
+    )
+    return p.parse_args(argv)
 
-    keys = [k.strip() for k in (args.keys.split(",") if args.keys
-                                else DEFAULT_KEYS) if k.strip()]
-    if not keys:
-        print("%s: no keys configured" % PROG, file=sys.stderr)
-        return 1
+
+def _iter_matches(
+    node: Any,
+    path: List[str],
+    compiled: List[re.Pattern],
+    recursive: bool,
+    separator: str,
+) -> Iterator[Tuple[str, Any]]:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            new_path = path + [key]
+            if any(rx.search(key) for rx in compiled):
+                yield separator.join(new_path), value
+            if recursive and isinstance(value, (dict, list)):
+                yield from _iter_matches(value, new_path, compiled, recursive, separator)
+    elif isinstance(node, list) and recursive:
+        for i, value in enumerate(node):
+            new_path = path + [f"[{i}]"]
+            if isinstance(value, (dict, list)):
+                yield from _iter_matches(value, new_path, compiled, recursive, separator)
+
+
+def _strip_in_place(node: Any, compiled: List[re.Pattern], recursive: bool) -> int:
+    removed = 0
+    if isinstance(node, dict):
+        drop: List[str] = []
+        for key, value in node.items():
+            if any(rx.search(key) for rx in compiled):
+                drop.append(key)
+                removed += 1
+            elif recursive and isinstance(value, (dict, list)):
+                removed += _strip_in_place(value, compiled, recursive)
+        for key in drop:
+            del node[key]
+    elif isinstance(node, list) and recursive:
+        for value in node:
+            removed += _strip_in_place(value, compiled, recursive)
+    return removed
+
+
+def _compile_patterns(extra: Optional[str]) -> List[re.Pattern]:
+    raw = list(DEFAULT_PATTERNS)
+    if extra:
+        raw.extend(s for s in (part.strip() for part in extra.split(",")) if s)
+    compiled = []
+    for pattern in raw:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            raise ValueError(f"invalid pattern {pattern!r}: {exc}") from exc
+    return compiled
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parse_args(argv)
 
     try:
-        if args.file == "-":
-            text = sys.stdin.read()
-        else:
-            with open(args.file, "r", encoding="utf-8") as fh:
-                text = fh.read()
-    except OSError as exc:
-        print("%s: cannot read %s: %s" % (PROG, args.file, exc), file=sys.stderr)
-        return 1
-
-    try:
-        docs, bare = parse_documents(text)
+        compiled = _compile_patterns(args.patterns)
     except ValueError as exc:
-        print("%s: %s" % (PROG, exc), file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    found = []
-    for di, doc in enumerate(docs):
-        path = "[%d]" % di
-        walk(doc, path, keys, args.prefix, found)
+    if args.input == "-":
+        fin = sys.stdin
+        close = False
+    else:
+        try:
+            fin = open(args.input, "r", encoding="utf-8")
+            close = True
+        except OSError as exc:
+            print(f"error: cannot open input: {exc}", file=sys.stderr)
+            return 1
 
-    for line in bare:
-        found.append(("(line)", line))
+    total_docs = 0
+    total_matches = 0
+    parse_errors: List[str] = []
+    kept_docs: List[str] = []
+
+    try:
+        for lineno, raw in enumerate(fin, 1):
+            raw = raw.strip()
+            if not raw:
+                if args.strip:
+                    kept_docs.append("")
+                continue
+            try:
+                doc = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                parse_errors.append(f"line {lineno}: {exc.msg}")
+                if args.strip:
+                    kept_docs.append(raw)
+                continue
+            total_docs += 1
+            if args.strip:
+                removed = _strip_in_place(doc, compiled, args.recursive)
+                total_matches += removed
+                kept_docs.append(json.dumps(doc, ensure_ascii=False))
+            else:
+                for path, value in _iter_matches(
+                    doc, [], compiled, args.recursive, args.separator
+                ):
+                    total_matches += 1
+                    print(
+                        json.dumps(
+                            {"path": path, "value": value}, ensure_ascii=False
+                        )
+                    )
+    finally:
+        if close:
+            fin.close()
+
+    if parse_errors:
+        for err in parse_errors:
+            print(f"error: {err}", file=sys.stderr)
+        # Parse errors are reported but do not abort: still exit 1 flagging them.
+        # The tool outputs what it could parse.
+        if args.strip:
+            for line in kept_docs:
+                print(line)
+        return 1
 
     if args.strip:
-        if args.json:
-            print("%s: --json not compatible with --strip" % PROG,
-                  file=sys.stderr)
-            return 1
-        for doc in docs:
-            stripped = strip_comments(doc, keys, args.prefix)
-            print(json.dumps(stripped, ensure_ascii=False))
-        return 0
+        for line in kept_docs:
+            print(line)
 
     if args.json:
-        report = {
-            "file": args.file,
-            "documents": len(docs),
-            "comments": [{"path": p, "value": v} for (p, v) in found],
-            "count": len(found),
+        summary = {
+            "ok": True,
+            "documents": total_docs,
+            "matches": total_matches,
+            "mode": "strip" if args.strip else "extract",
+            "recursive": bool(args.recursive),
         }
-        json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
-        sys.stdout.write("\n")
-    else:
-        for (p, v) in found:
-            print("%s\t%s" % (p, v))
+        print(json.dumps(summary, ensure_ascii=False, indent=2), file=sys.stderr)
 
-    if args.check:
-        if not found:
-            if not args.quiet and not args.json:
-                print("%s: no comment found in %s" % (PROG, args.file),
-                      file=sys.stderr)
-            return 2
-        if not args.quiet and not args.json:
-            print("%s: ok - %d comment(s) found" % (PROG, len(found)),
-                  file=sys.stderr)
+    if args.check and total_matches == 0:
+        return 2
     return 0
-
-
-def strip_comments(obj, keys, prefix_mode):
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            kl = k.lower()
-            if prefix_mode:
-                matched = any(kl.startswith(p.lower()) or kl == p.lower()
-                              for p in keys)
-            else:
-                matched = kl in [x.lower() for x in keys]
-            if matched:
-                continue
-            out[k] = strip_comments(v, keys, prefix_mode)
-        return out
-    if isinstance(obj, list):
-        return [strip_comments(x, keys, prefix_mode) for x in obj]
-    return obj
 
 
 if __name__ == "__main__":
