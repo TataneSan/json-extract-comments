@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "json-extract-comments"
+version = "1.0.0"
+description = "Extract comment-like fields (//, _comment, comment_*) from JSON/JSONL documents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "TataneSan" }]
+keywords = ["json", "comments", "extraction", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Filters",
+]
+
+[project.scripts]
+json-extract-comments = "json_extract_comments.cli:main"
+
+[tool.setuptools]
+packages = ["json_extract_comments"]
